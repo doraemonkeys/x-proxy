@@ -1,0 +1,19 @@
+# Binaries for programs
+x-proxy-server
+x-proxy-client
+
+# Dependency directories
+vendor/
+
+# IDE and OS specific files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Config files
+config*json
+rsync.sh

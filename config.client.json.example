@@ -1,0 +1,27 @@
+{
+  "server_addr": "0.0.0.0:8388",
+  "key": "f1b2d4e8-9b3a-4e1d-8d4b-7c2f381a4c9f",
+  "log_level": "info",
+  "transport": "tcp",
+  "read_write_deadline": 10,
+  "disable_obfuscation": false,
+  "obfuscator": "xor-hardware",
+  "enable_stats": true,
+  "tls": {
+    "ca_file": "certs/server.crt"
+  },
+  "modes": [
+    {
+      "type": "transparent",
+      "listen_addr": "192.168.12.1:3081"
+    },
+    {
+      "type": "socks5",
+      "listen_addr": "192.168.12.1:3080"
+    },
+    {
+      "type": "http",
+      "listen_addr": "192.168.12.1:3082"
+    }
+  ]
+}

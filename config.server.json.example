@@ -1,0 +1,14 @@
+{
+  "listen_addr": "0.0.0.0:8388",
+  "key": "f1b2d4e8-9b3a-4e1d-8d4b-7c2f381a4c9f",
+  "log_level": "info",
+  "transport": "tcp",
+  "read_write_deadline": 10,
+  "disable_obfuscation": false,
+  "obfuscator": "xor",
+  "enable_stats": true,
+  "tls": {
+    "cert_file": "certs/server.crt",
+    "key_file": "certs/server.key"
+  }
+}
