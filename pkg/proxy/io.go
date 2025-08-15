@@ -86,7 +86,7 @@ func copyWithTimeout(ctx context.Context, dst, src net.Conn, wg *sync.WaitGroup,
 	}()
 
 	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf) //TODO: 使用固定的buffer
+	defer bufferPool.Put(buf) //TODO: argument should be pointer-like to avoid allocations (SA6002)go-staticcheck
 
 	for {
 		select {
