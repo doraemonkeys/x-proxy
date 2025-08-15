@@ -90,3 +90,7 @@ func (c *xorHardwareConn) Write(p []byte) (n int, err error) {
 
 	return c.Conn.Write(buf)
 }
+
+func (c *xorHardwareConn) Close() (err error) {
+	return c.Conn.Close()
+}

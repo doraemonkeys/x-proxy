@@ -14,8 +14,12 @@ type TLSConfig struct {
 
 // ClientModeConfig holds the configuration for a single client proxy mode
 type ClientModeConfig struct {
-	Type       string `json:"type"` // http, https, socks5, transparent
-	ListenAddr string `json:"listen_addr"`
+	Type       string   `json:"type"` // http, https, socks5, transparent, tun
+	ListenAddr string   `json:"listen_addr"`
+	TunName    string   `json:"tun_name,omitempty"`    // TUN interface name (for tun mode)
+	TunIP      string   `json:"tun_ip,omitempty"`      // TUN interface IP (for tun mode)
+	TunNetmask string   `json:"tun_netmask,omitempty"` // TUN interface netmask (for tun mode)
+	Routes     []string `json:"routes,omitempty"`      // Routes to add (for tun mode)
 }
 
 // ClientConfig holds the configuration for the client

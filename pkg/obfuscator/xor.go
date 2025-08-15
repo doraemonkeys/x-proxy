@@ -59,6 +59,10 @@ func (c *xorConn) Write(p []byte) (n int, err error) {
 	return c.Conn.Write(buf)
 }
 
+func (c *xorConn) Close() (err error) {
+	return c.Conn.Close()
+}
+
 // noopCipher is a cipher that does nothing, for when the key is empty.
 type noopCipher struct{}
 

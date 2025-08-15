@@ -2,10 +2,11 @@ package obfuscator
 
 import (
 	"crypto/rand"
-	"golang.org/x/crypto/chacha20"
 	"io"
 	"net"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
 )
 
 // readFullWithTimeout reads exactly len(buf) bytes from conn with a timeout
@@ -94,4 +95,8 @@ func (c *chaCha20Conn) Read(p []byte) (n int, err error) {
 		c.readCipher.XORKeyStream(p[:n], p[:n])
 	}
 	return
+}
+
+func (c *chaCha20Conn) Close() (err error) {
+	return c.Conn.Close()
 }

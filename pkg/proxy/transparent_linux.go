@@ -145,6 +145,7 @@ func (c *Client) handleTransparent(localConn net.Conn) {
 	target, err := getOriginalDst(localConn)
 	if err != nil {
 		logger.Warnf("Failed to get original destination for %s: %v", localConn.RemoteAddr(), err)
+		localConn.Close()
 		return
 	}
 
@@ -155,101 +156,30 @@ func (c *Client) handleTransparent(localConn net.Conn) {
 	c.StatsManager.AddConnection(connID, stats.ConnTypeTCP, localConn.RemoteAddr().String(), target, "transparent")
 	defer c.StatsManager.RemoveConnection(connID)
 
-	remoteConn, err := c.dial()
+	remoteConn, err := c.Dial()
 	if err != nil {
 		logger.Warnf("Failed to connect to remote server %s for client %s: %v", c.Config.ServerAddr, localConn.RemoteAddr(), err)
+		localConn.Close()
 		return
 	}
-	defer remoteConn.Close()
 	logger.Debugf("Connected to remote server %s for client %s", c.Config.ServerAddr, localConn.RemoteAddr())
 
 	// Wrap the remote connection with the obfuscator
 	obfuscatedRemoteConn := c.Cipher.Obfuscate(remoteConn)
-	defer obfuscatedRemoteConn.Close()
 
 	_, err = obfuscatedRemoteConn.Write([]byte("tcp:" + target + string(byte(0))))
 	if err != nil {
 		logger.Warnf("Failed to send target address to remote server: %v", err)
+		localConn.Close()
+		obfuscatedRemoteConn.Close()
 		return
 	}
 
-	// Relay data with timeout
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	// Relay data with timeout - this function will handle closing both connections
 	timeout := time.Duration(c.Config.ReadWriteDeadline) * time.Second
+	relayWithTimeout(localConn, obfuscatedRemoteConn, timeout)
 
-	go func() {
-		defer wg.Done()
-		defer obfuscatedRemoteConn.Close()
-		for {
-			err := localConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := localConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (local -> remote) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (local -> remote) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = obfuscatedRemoteConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = obfuscatedRemoteConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (local -> remote write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer localConn.Close()
-		for {
-			err := obfuscatedRemoteConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := obfuscatedRemoteConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (remote -> local) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (remote -> local) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = localConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = localConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (remote -> local write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	wg.Wait()
+	logger.Debugf("Transparent proxy relay for %s completed", localConn.RemoteAddr())
 }
 
 func getOriginalDstFromOOB(oob []byte) (net.IP, int, error) {
@@ -329,7 +259,7 @@ func (c *Client) handleTransparentUDP(localConn *net.UDPConn) {
 
 		if !ok {
 			logger.Debugf("UDP: No session found for %s. Creating new session to %s", raddr, originalDst)
-			newRemoteConn, err := c.dial()
+			newRemoteConn, err := c.Dial()
 			if err != nil {
 				logger.Warnf("UDP: Failed to connect to remote server for %s: %v", raddr, err)
 				continue
@@ -348,90 +278,7 @@ func (c *Client) handleTransparentUDP(localConn *net.UDPConn) {
 			sessions[raddr.String()] = obfuscatedRemoteConn
 			mu.Unlock()
 
-			go func(laddr *net.UDPAddr, rconn net.Conn, origIP net.IP, origPort int, connID string) {
-				defer func() {
-					mu.Lock()
-					delete(sessions, laddr.String())
-					mu.Unlock()
-					rconn.Close()
-					c.StatsManager.RemoveConnection(connID)
-					logger.Debugf("UDP: Closed remote connection for %s", laddr)
-				}()
-
-				logger.Debugf("UDP: Starting goroutine to handle server -> client traffic for %s", laddr)
-				buf := make([]byte, 4096)
-				for {
-					rconn.SetReadDeadline(time.Now().Add(time.Duration(c.Config.ReadWriteDeadline) * time.Second))
-					n, err := rconn.Read(buf)
-					if err != nil {
-						if err != io.EOF {
-							logger.Warnf("UDP: Error reading from remote for %s: %v", laddr, err)
-						} else {
-							logger.Debugf("UDP: Remote connection closed by peer for %s", laddr)
-						}
-						return
-					}
-					logger.Debugf("UDP: Read %d bytes from remote for %s, forwarding to local", n, laddr)
-
-					// Create a new socket to send the reply with the correct source IP and port
-					var sendFamily int
-					if origIP.To4() != nil {
-						sendFamily = unix.AF_INET
-					} else {
-						sendFamily = unix.AF_INET6
-					}
-
-					sendFd, err := unix.Socket(sendFamily, unix.SOCK_DGRAM, 0)
-					if err != nil {
-						logger.Warnf("UDP: Failed to create reply socket for %s: %v", laddr, err)
-						return // Exit goroutine
-					}
-
-					if err := unix.SetsockoptInt(sendFd, unix.IPPROTO_IP, unix.IP_TRANSPARENT, 1); err != nil {
-						unix.Close(sendFd)
-						logger.Warnf("UDP: Failed to set IP_TRANSPARENT on reply socket for %s: %v", laddr, err)
-						return
-					}
-
-					var bindAddr unix.Sockaddr
-					if origIP.To4() != nil {
-						sa4 := &unix.SockaddrInet4{Port: origPort}
-						copy(sa4.Addr[:], origIP.To4())
-						bindAddr = sa4
-					} else {
-						sa6 := &unix.SockaddrInet6{Port: origPort}
-						copy(sa6.Addr[:], origIP.To16())
-						bindAddr = sa6
-					}
-
-					if err := unix.Bind(sendFd, bindAddr); err != nil {
-						unix.Close(sendFd)
-						logger.Warnf("UDP: Failed to bind reply socket to %s:%d for %s: %v", origIP, origPort, laddr, err)
-						return
-					}
-
-					// Convert destination addr to sockaddr for sendto
-					var destAddr unix.Sockaddr
-					if laddr.IP.To4() != nil {
-						sa4 := &unix.SockaddrInet4{Port: laddr.Port}
-						copy(sa4.Addr[:], laddr.IP.To4())
-						destAddr = sa4
-					} else {
-						sa6 := &unix.SockaddrInet6{Port: laddr.Port}
-						copy(sa6.Addr[:], laddr.IP.To16())
-						destAddr = sa6
-					}
-
-					if err := unix.Sendto(sendFd, buf[:n], 0, destAddr); err != nil {
-						unix.Close(sendFd)
-						logger.Warnf("UDP: Failed to sendto on reply socket for %s: %v", laddr, err)
-						return
-					}
-
-					unix.Close(sendFd) // Close after sending
-					logger.Debugf("UDP: Wrote %d bytes to local for %s (from %s:%d)", n, laddr, origIP, origPort)
-				}
-			}(raddr, obfuscatedRemoteConn, originalDstIP, originalDstPort, connID)
+			go c.handleUDPUpstreamTraffic(raddr, obfuscatedRemoteConn, originalDstIP, originalDstPort, connID, &mu, sessions)
 
 			// Update remoteConn to the correct obfuscated connection for the current write
 			remoteConn = obfuscatedRemoteConn
@@ -452,5 +299,91 @@ func (c *Client) handleTransparentUDP(localConn *net.UDPConn) {
 		} else {
 			logger.Debugf("UDP: Successfully wrote %d bytes to remote for %s", wn, raddr)
 		}
+	}
+}
+
+// read server udp traffic and forward packet to client
+func (c *Client) handleUDPUpstreamTraffic(laddr *net.UDPAddr, rconn net.Conn, origIP net.IP, origPort int, connID string, mu *sync.Mutex, sessions map[string]net.Conn) {
+	defer func() {
+		mu.Lock()
+		delete(sessions, laddr.String())
+		mu.Unlock()
+		rconn.Close()
+		c.StatsManager.RemoveConnection(connID)
+		logger.Debugf("UDP: Closed remote connection for %s", laddr)
+	}()
+
+	logger.Debugf("UDP: Starting goroutine to handle server -> client traffic for %s", laddr)
+	buf := make([]byte, 4096)
+	for {
+		rconn.SetReadDeadline(time.Now().Add(time.Duration(c.Config.ReadWriteDeadline) * time.Second))
+		n, err := rconn.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				logger.Warnf("UDP: Error reading from remote for %s: %v", laddr, err)
+			} else {
+				logger.Debugf("UDP: Remote connection closed by peer for %s", laddr)
+			}
+			return
+		}
+		logger.Debugf("UDP: Read %d bytes from remote for %s, forwarding to local", n, laddr)
+
+		// Create a new socket to send the reply with the correct source IP and port
+		var sendFamily int
+		if origIP.To4() != nil {
+			sendFamily = unix.AF_INET
+		} else {
+			sendFamily = unix.AF_INET6
+		}
+
+		sendFd, err := unix.Socket(sendFamily, unix.SOCK_DGRAM, 0)
+		if err != nil {
+			logger.Warnf("UDP: Failed to create reply socket for %s: %v", laddr, err)
+			return // Exit goroutine
+		}
+
+		if err := unix.SetsockoptInt(sendFd, unix.IPPROTO_IP, unix.IP_TRANSPARENT, 1); err != nil {
+			unix.Close(sendFd)
+			logger.Warnf("UDP: Failed to set IP_TRANSPARENT on reply socket for %s: %v", laddr, err)
+			return
+		}
+
+		var bindAddr unix.Sockaddr
+		if origIP.To4() != nil {
+			sa4 := &unix.SockaddrInet4{Port: origPort}
+			copy(sa4.Addr[:], origIP.To4())
+			bindAddr = sa4
+		} else {
+			sa6 := &unix.SockaddrInet6{Port: origPort}
+			copy(sa6.Addr[:], origIP.To16())
+			bindAddr = sa6
+		}
+
+		if err := unix.Bind(sendFd, bindAddr); err != nil {
+			unix.Close(sendFd)
+			logger.Warnf("UDP: Failed to bind reply socket to %s:%d for %s: %v", origIP, origPort, laddr, err)
+			return
+		}
+
+		// Convert destination addr to sockaddr for sendto
+		var destAddr unix.Sockaddr
+		if laddr.IP.To4() != nil {
+			sa4 := &unix.SockaddrInet4{Port: laddr.Port}
+			copy(sa4.Addr[:], laddr.IP.To4())
+			destAddr = sa4
+		} else {
+			sa6 := &unix.SockaddrInet6{Port: laddr.Port}
+			copy(sa6.Addr[:], laddr.IP.To16())
+			destAddr = sa6
+		}
+
+		if err := unix.Sendto(sendFd, buf[:n], 0, destAddr); err != nil {
+			unix.Close(sendFd)
+			logger.Warnf("UDP: Failed to sendto on reply socket for %s: %v", laddr, err)
+			return
+		}
+
+		unix.Close(sendFd) // Close after sending
+		logger.Debugf("UDP: Wrote %d bytes to local for %s (from %s:%d)", n, laddr, origIP, origPort)
 	}
 }

@@ -31,12 +31,12 @@ func NewServer(config *config.ServerConfig, cipher obfuscator.Cipher) *Server {
 	if config.ReadWriteDeadline == 0 {
 		config.ReadWriteDeadline = 120
 	}
-	
+
 	// Enable stats by default if not explicitly configured
 	if !config.EnableStats {
 		config.EnableStats = true
 	}
-	
+
 	return &Server{
 		Config:       config,
 		Cipher:       cipher,
@@ -92,21 +92,25 @@ func (s *Server) Run() {
 	}
 }
 
+
+
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
 	logger.Debugf("Handling connection for %s", conn.RemoteAddr())
 
 	// For server side, we need to decrypt incoming data from client
 	// XOR is symmetric, so we use the same Obfuscate method to decrypt
 	deobfuscatedConn := s.Cipher.Obfuscate(conn)
-	defer deobfuscatedConn.Close()
 
-	reader := bufio.NewReader(deobfuscatedConn)
+	bconn := &bufferedConn{
+		Conn:   deobfuscatedConn,
+		reader: bufio.NewReader(deobfuscatedConn),
+	}
 
 	// Read the first header to determine the protocol
-	targetAddrBytes, err := reader.ReadBytes(0)
+	targetAddrBytes, err := bconn.reader.ReadBytes(0)
 	if err != nil {
 		logger.Warnf("Failed to read target address from %s: %v", conn.RemoteAddr(), err)
+		conn.Close()
 		return
 	}
 
@@ -130,7 +134,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	logger.Debugf("Initial request protocol %s for %s to %s", proto, conn.RemoteAddr(), initialTargetAddr)
 
 	if proto == "tcp" {
-		// Add connection statistics  
+		// Add connection statistics
 		connID := stats.GenerateConnectionID(conn.RemoteAddr().String(), initialTargetAddr)
 		s.StatsManager.AddConnection(connID, stats.ConnTypeTCP, conn.RemoteAddr().String(), initialTargetAddr, "server")
 		defer s.StatsManager.RemoveConnection(connID)
@@ -139,86 +143,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 		targetConn, err := net.Dial("tcp", initialTargetAddr)
 		if err != nil {
 			logger.Warnf("Failed to connect to target %s for client %s: %v", initialTargetAddr, conn.RemoteAddr(), err)
+			conn.Close()
 			return
 		}
-		defer targetConn.Close()
-
-		var wg sync.WaitGroup
-		wg.Add(2)
 
 		timeout := time.Duration(s.Config.ReadWriteDeadline) * time.Second
-
-		go func() {
-			defer wg.Done()
-			defer targetConn.Close()
-			for {
-				err := deobfuscatedConn.SetReadDeadline(time.Now().Add(timeout))
-				if err != nil {
-					logger.Warnf("Failed to set read deadline on client connection for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-				
-				buf := make([]byte, 32*1024)
-				n, err := reader.Read(buf)
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						logger.Debugf("Read timeout (client -> target) for %s", conn.RemoteAddr())
-					} else if err != io.EOF {
-						logger.Warnf("Relay error (client -> target) for %s: %v", conn.RemoteAddr(), err)
-					}
-					break
-				}
-				
-				err = targetConn.SetWriteDeadline(time.Now().Add(timeout))
-				if err != nil {
-					logger.Warnf("Failed to set write deadline on target connection for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-				
-				_, err = targetConn.Write(buf[:n])
-				if err != nil {
-					logger.Warnf("Relay error (client -> target write) for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-			}
-		}()
-
-		go func() {
-			defer wg.Done()
-			defer deobfuscatedConn.Close()
-			for {
-				err := targetConn.SetReadDeadline(time.Now().Add(timeout))
-				if err != nil {
-					logger.Warnf("Failed to set read deadline on target connection for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-				
-				buf := make([]byte, 32*1024)
-				n, err := targetConn.Read(buf)
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						logger.Debugf("Read timeout (target -> client) for %s", conn.RemoteAddr())
-					} else if err != io.EOF {
-						logger.Warnf("Relay error (target -> client) for %s: %v", conn.RemoteAddr(), err)
-					}
-					break
-				}
-				
-				err = deobfuscatedConn.SetWriteDeadline(time.Now().Add(timeout))
-				if err != nil {
-					logger.Warnf("Failed to set write deadline on client connection for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-				
-				_, err = deobfuscatedConn.Write(buf[:n])
-				if err != nil {
-					logger.Warnf("Relay error (target -> client write) for %s: %v", conn.RemoteAddr(), err)
-					break
-				}
-			}
-		}()
-
-		wg.Wait()
+		relayWithTimeout(bconn, targetConn, timeout)
 	} else if proto == "udp" {
 		// Handle UDP datagram stream
 		targetConns := make(map[string]net.Conn)
@@ -232,14 +162,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}()
 
 		// Process the first packet that we've already read the header for
-		if err := s.handleUDPPacket(reader, initialTargetAddr, conn.RemoteAddr().String(), deobfuscatedConn, targetConns, &mu); err != nil {
+		if err := s.handleUDPPacket(bconn.reader, initialTargetAddr, conn.RemoteAddr().String(), bconn, targetConns, &mu); err != nil {
 			logger.Warnf("Failed to handle initial UDP packet for %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 
 		// Loop to process subsequent packets in the same stream
 		for {
-			targetAddrBytes, err := reader.ReadBytes(0)
+			targetAddrBytes, err := bconn.reader.ReadBytes(0)
 			if err != nil {
 				if err != io.EOF {
 					logger.Warnf("Failed to read subsequent UDP header for %s: %v", conn.RemoteAddr(), err)
@@ -249,7 +179,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			targetAddr := strings.TrimPrefix(string(bytes.TrimRight(targetAddrBytes, "\x00")), "udp:")
 
-			if err := s.handleUDPPacket(reader, targetAddr, conn.RemoteAddr().String(), deobfuscatedConn, targetConns, &mu); err != nil {
+			if err := s.handleUDPPacket(bconn.reader, targetAddr, conn.RemoteAddr().String(), bconn, targetConns, &mu); err != nil {
 				logger.Warnf("Failed to handle subsequent UDP packet for %s: %v", conn.RemoteAddr(), err)
 				return
 			}
@@ -259,7 +189,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 func (s *Server) handleUDPPacket(reader *bufio.Reader, targetAddr, clientAddr string, deobfuscatedConn net.Conn, targetConns map[string]net.Conn, mu *sync.Mutex) error {
 	timeout := time.Duration(s.Config.ReadWriteDeadline) * time.Second
-	
+
 	// Read the 2-byte length prefix with timeout
 	lenBuf := make([]byte, 2)
 	if err := deobfuscatedConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
@@ -293,11 +223,11 @@ func (s *Server) handleUDPPacket(reader *bufio.Reader, targetAddr, clientAddr st
 		mu.Lock()
 		targetConns[targetAddr] = targetConn
 		mu.Unlock()
-		
+
 		// Add UDP connection statistics for new connection
 		connID := stats.GenerateConnectionID(clientAddr, targetAddr)
 		s.StatsManager.AddConnection(connID, stats.ConnTypeUDP, clientAddr, targetAddr, "server")
-		
+
 		// Store connection ID for cleanup (we'll use a simple approach by storing it in a map)
 		// Note: In production, you might want a more sophisticated connection tracking system
 
@@ -310,6 +240,7 @@ func (s *Server) handleUDPPacket(reader *bufio.Reader, targetAddr, clientAddr st
 				delete(targetConns, targetAddr)
 				mu.Unlock()
 				targetConn.Close()
+				s.StatsManager.RemoveConnection(connID)
 			}()
 
 			buf := make([]byte, 65535)

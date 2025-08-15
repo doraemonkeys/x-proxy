@@ -11,24 +11,27 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"x-proxy/pkg/config"
 	"x-proxy/pkg/logger"
 	"x-proxy/pkg/obfuscator"
 	"x-proxy/pkg/stats"
+	"x-proxy/pkg/tun"
 
 	"github.com/xtaci/kcp-go"
 )
 
 // Client is the proxy client.
 type Client struct {
-	Config      *config.ClientConfig
-	Cipher      obfuscator.Cipher
-	TLSConfig   *tls.Config
+	Config       *config.ClientConfig
+	Cipher       obfuscator.Cipher
+	TLSConfig    *tls.Config
 	StatsManager *stats.StatsManager
 }
 
@@ -38,7 +41,7 @@ func NewClient(config *config.ClientConfig, cipher obfuscator.Cipher) *Client {
 	if config.ReadWriteDeadline == 0 {
 		config.ReadWriteDeadline = 120
 	}
-	
+
 	// Enable stats by default if not explicitly configured
 	if !config.EnableStats {
 		config.EnableStats = true
@@ -77,7 +80,10 @@ func (c *Client) Run() {
 		go func(mc config.ClientModeConfig) {
 			defer wg.Done()
 
-			if mc.Type == "transparent" {
+			if mc.Type == "tun" {
+				// TUN mode
+				c.handleTunMode(mc)
+			} else if mc.Type == "transparent" {
 				// TCP listener for transparent mode
 				go func() {
 					listener, err := net.Listen("tcp", mc.ListenAddr)
@@ -130,7 +136,68 @@ func (c *Client) Run() {
 	select {}
 }
 
-func (c *Client) dial() (net.Conn, error) {
+// handleTunMode handles TUN interface mode
+func (c *Client) handleTunMode(mc config.ClientModeConfig) {
+	logger.Infof("Starting TUN mode with interface %s", mc.TunName)
+
+	// Create TUN device
+	tunDevice, err := tun.NewTunDevice(mc.TunName)
+	if err != nil {
+		logger.Errorf("Failed to create TUN device %s: %v", mc.TunName, err)
+		return
+	}
+	defer tunDevice.Close()
+
+	// Setup signal handler for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logger.Infof("Received shutdown signal, closing TUN device %s", tunDevice.Name)
+		tunDevice.Close()
+		os.Exit(0)
+	}()
+
+	// Configure TUN interface
+	if mc.TunIP != "" && mc.TunNetmask != "" {
+		err = tunDevice.SetIP(mc.TunIP, mc.TunNetmask)
+		if err != nil {
+			logger.Errorf("Failed to configure TUN interface %s: %v", mc.TunName, err)
+			return
+		}
+		logger.Infof("TUN interface %s configured with IP %s/%s", mc.TunName, mc.TunIP, mc.TunNetmask)
+	}
+	// Add routes
+	for _, route := range mc.Routes {
+		err = tunDevice.AddRoute(route, mc.TunIP)
+		logger.Infof("Start adding dest %s for TUN interface %s", route, mc.TunName)
+		if err != nil {
+			logger.Errorf("Failed to add route %s for TUN interface %s: %v", route, mc.TunName, err)
+			return
+		}
+		logger.Infof("Added route %s via %s for TUN interface %s", route, mc.TunIP, mc.TunName)
+	}
+
+	// Create forwarder using the client components
+	forwarder := tun.NewProxyForwarder(c.Config, c.Cipher, c.TLSConfig)
+
+	// Create and start TUN handler
+	handler := tun.NewHandler(tunDevice, forwarder)
+	err = handler.Start()
+	if err != nil {
+		logger.Errorf("Failed to start TUN handler: %v", err)
+		return
+	}
+	defer handler.Stop()
+
+	logger.Infof("TUN mode started successfully on interface %s", mc.TunName)
+
+	// Keep the handler running
+	select {}
+}
+
+// Dial establishes a connection to the proxy server
+func (c *Client) Dial() (net.Conn, error) {
 	switch c.Config.Transport {
 	case "kcp":
 		remoteConn, err := kcp.DialWithOptions(c.Config.ServerAddr, nil, 0, 0)
@@ -165,12 +232,29 @@ func (c *Client) handleConnection(localConn net.Conn, modeType string) {
 func (c *Client) handleHttp(localConn net.Conn) {
 	logger.Debugf("Handling HTTP request for %s", localConn.RemoteAddr())
 
-	reader := bufio.NewReader(localConn)
-	req, err := http.ReadRequest(reader)
+	timeout := time.Duration(c.Config.ReadWriteDeadline) * time.Second
+
+	bconn := &bufferedConn{
+		Conn:   localConn,
+		reader: bufio.NewReader(localConn),
+	}
+
+	if err := bconn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
+
+	req, err := http.ReadRequest(bconn.reader)
 	if err != nil {
 		if err != io.EOF {
 			logger.Warnf("Failed to read http request from %s: %v", localConn.RemoteAddr(), err)
 		}
+		return
+	}
+
+	// Reset deadline after successful read
+	if err := bconn.SetReadDeadline(time.Time{}); err != nil {
+		logger.Warnf("Failed to reset read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
 		return
 	}
 
@@ -189,7 +273,7 @@ func (c *Client) handleHttp(localConn net.Conn) {
 	c.StatsManager.AddConnection(connID, stats.ConnTypeTCP, localConn.RemoteAddr().String(), host, "http")
 	defer c.StatsManager.RemoveConnection(connID)
 
-	remoteConn, err := c.dial()
+	remoteConn, err := c.Dial()
 	if err != nil {
 		logger.Warnf("Failed to connect to remote server %s for client %s: %v", c.Config.ServerAddr, localConn.RemoteAddr(), err)
 		return
@@ -197,7 +281,6 @@ func (c *Client) handleHttp(localConn net.Conn) {
 
 	// Wrap the remote connection with the obfuscator
 	obfuscatedRemoteConn := c.Cipher.Obfuscate(remoteConn)
-	defer obfuscatedRemoteConn.Close()
 
 	prefixedHost := "tcp:" + host
 	if req.Method == "CONNECT" {
@@ -206,11 +289,13 @@ func (c *Client) handleHttp(localConn net.Conn) {
 		_, err := obfuscatedRemoteConn.Write([]byte(prefixedHost + "\x00"))
 		if err != nil {
 			logger.Warnf("Failed to send target address to remote server: %v", err)
+			obfuscatedRemoteConn.Close()
 			return
 		}
 		_, err = localConn.Write([]byte("HTTP/1.1 200 Connection established"))
 		if err != nil {
 			logger.Warnf("Failed to write 200 OK to client %s: %v", localConn.RemoteAddr(), err)
+			obfuscatedRemoteConn.Close()
 			return
 		}
 		logger.Debugf("Established HTTPS tunnel for %s to %s", localConn.RemoteAddr(), host)
@@ -219,6 +304,7 @@ func (c *Client) handleHttp(localConn net.Conn) {
 		var reqBuf bytes.Buffer
 		if err := req.Write(&reqBuf); err != nil {
 			logger.Errorf("Failed to write request to buffer: %v", err)
+			obfuscatedRemoteConn.Close()
 			return
 		}
 
@@ -227,93 +313,26 @@ func (c *Client) handleHttp(localConn net.Conn) {
 		_, err := obfuscatedRemoteConn.Write(payload)
 		if err != nil {
 			logger.Warnf("Failed to write obfuscated request to remote: %v", err)
+			obfuscatedRemoteConn.Close()
 			return
 		}
 		logger.Debugf("Forwarded HTTP request for %s to %s", localConn.RemoteAddr(), host)
 	}
 
 	// Relay data with timeout
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	timeout := time.Duration(c.Config.ReadWriteDeadline) * time.Second
-
-	go func() {
-		defer wg.Done()
-		defer obfuscatedRemoteConn.Close()
-		for {
-			err := localConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := localConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (local -> remote) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (local -> remote) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = obfuscatedRemoteConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = obfuscatedRemoteConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (local -> remote write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer localConn.Close()
-		for {
-			err := obfuscatedRemoteConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := obfuscatedRemoteConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (remote -> local) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (remote -> local) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = localConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = localConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (remote -> local write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	wg.Wait()
+	relayWithTimeout(bconn, obfuscatedRemoteConn, timeout)
 }
 
 func (c *Client) handleSocks5(localConn net.Conn) {
 	logger.Debugf("Handling SOCKS5 request for %s", localConn.RemoteAddr())
 
+	timeout := time.Duration(c.Config.ReadWriteDeadline) * time.Second
+
+	// Handshake
+	if err := localConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
 	buf := make([]byte, 257)
 	n, err := localConn.Read(buf)
 	if err != nil || n < 2 {
@@ -322,11 +341,30 @@ func (c *Client) handleSocks5(localConn net.Conn) {
 	}
 	logger.Debugf("SOCKS5 handshake from %s successful", localConn.RemoteAddr())
 
-	localConn.Write([]byte{0x05, 0x00})
+	if err := localConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		logger.Warnf("Failed to set write deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
+	_, err = localConn.Write([]byte{0x05, 0x00})
+	if err != nil {
+		logger.Warnf("Failed to write SOCKS5 handshake to %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
 
+	// Request
+	if err := localConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
 	n, err = localConn.Read(buf)
 	if err != nil || n < 4 {
 		logger.Warnf("Failed to read SOCKS5 request from %s: %v", localConn.RemoteAddr(), err)
+		return
+	}
+
+	// Reset deadline
+	if err := localConn.SetDeadline(time.Time{}); err != nil {
+		logger.Warnf("Failed to reset deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
 		return
 	}
 
@@ -355,7 +393,7 @@ func (c *Client) handleSocks5(localConn net.Conn) {
 	target := net.JoinHostPort(targetAddr, strconv.Itoa(int(port)))
 	logger.Debugf("SOCKS5 target for %s is %s", localConn.RemoteAddr(), target)
 
-	remoteConn, err := c.dial()
+	remoteConn, err := c.Dial()
 	if err != nil {
 		logger.Warnf("Failed to connect to remote server %s for client %s: %v", c.Config.ServerAddr, localConn.RemoteAddr(), err)
 		localConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) // General SOCKS server failure
@@ -364,12 +402,12 @@ func (c *Client) handleSocks5(localConn net.Conn) {
 
 	// Wrap the remote connection with the obfuscator
 	obfuscatedRemoteConn := c.Cipher.Obfuscate(remoteConn)
-	defer obfuscatedRemoteConn.Close()
 
 	prefixedTarget := "tcp:" + target
 	_, err = obfuscatedRemoteConn.Write([]byte(prefixedTarget + "\x00"))
 	if err != nil {
 		logger.Warnf("Failed to send target address to remote server: %v", err)
+		obfuscatedRemoteConn.Close()
 		return
 	}
 
@@ -382,80 +420,5 @@ func (c *Client) handleSocks5(localConn net.Conn) {
 	defer c.StatsManager.RemoveConnection(connID)
 
 	// Relay data with timeout
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	timeout := time.Duration(c.Config.ReadWriteDeadline) * time.Second
-
-	go func() {
-		defer wg.Done()
-		defer obfuscatedRemoteConn.Close()
-		for {
-			err := localConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := localConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (local -> remote) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (local -> remote) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = obfuscatedRemoteConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = obfuscatedRemoteConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (local -> remote write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer localConn.Close()
-		for {
-			err := obfuscatedRemoteConn.SetReadDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set read deadline on remote connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			buf := make([]byte, 32*1024)
-			n, err := obfuscatedRemoteConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					logger.Debugf("Read timeout (remote -> local) for %s", localConn.RemoteAddr())
-				} else if err != io.EOF {
-					logger.Warnf("Relay error (remote -> local) for %s: %v", localConn.RemoteAddr(), err)
-				}
-				break
-			}
-			
-			err = localConn.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				logger.Warnf("Failed to set write deadline on local connection for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-			
-			_, err = localConn.Write(buf[:n])
-			if err != nil {
-				logger.Warnf("Relay error (remote -> local write) for %s: %v", localConn.RemoteAddr(), err)
-				break
-			}
-		}
-	}()
-
-	wg.Wait()
+	relayWithTimeout(localConn, obfuscatedRemoteConn, timeout)
 }

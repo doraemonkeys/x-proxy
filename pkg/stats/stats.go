@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
-	
+
 	"x-proxy/pkg/logger"
 )
 
@@ -19,14 +19,14 @@ const (
 
 // ConnectionInfo holds detailed information about a connection
 type ConnectionInfo struct {
-	ID          string         `json:"id"`
-	Type        ConnectionType `json:"type"`
-	SourceAddr  string         `json:"source_addr"`
-	TargetAddr  string         `json:"target_addr"`
-	ProxyMode   string         `json:"proxy_mode,omitempty"`
-	StartTime   time.Time      `json:"start_time"`
-	BytesSent   int64          `json:"bytes_sent"`
-	BytesRecv   int64          `json:"bytes_recv"`
+	ID         string         `json:"id"`
+	Type       ConnectionType `json:"type"`
+	SourceAddr string         `json:"source_addr"`
+	TargetAddr string         `json:"target_addr"`
+	ProxyMode  string         `json:"proxy_mode,omitempty"`
+	StartTime  time.Time      `json:"start_time"`
+	BytesSent  int64          `json:"bytes_sent"`
+	BytesRecv  int64          `json:"bytes_recv"`
 }
 
 // StatsManager manages connection statistics
@@ -43,12 +43,12 @@ func NewStatsManager(enabled bool) *StatsManager {
 		enabled:     enabled,
 		connections: make(map[string]*ConnectionInfo),
 	}
-	
+
 	if enabled {
 		// Start periodic stats logging
 		go sm.periodicLog()
 	}
-	
+
 	return sm
 }
 
@@ -57,10 +57,10 @@ func (sm *StatsManager) AddConnection(id string, connType ConnectionType, source
 	if !sm.enabled {
 		return
 	}
-	
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	
+
 	sm.connections[id] = &ConnectionInfo{
 		ID:         id,
 		Type:       connType,
@@ -70,7 +70,7 @@ func (sm *StatsManager) AddConnection(id string, connType ConnectionType, source
 		StartTime:  time.Now(),
 	}
 	sm.totalCount++
-	
+
 	logger.Debugf("Stats: Added connection %s (%s) %s -> %s via %s", id, connType, sourceAddr, targetAddr, proxyMode)
 }
 
@@ -79,13 +79,13 @@ func (sm *StatsManager) RemoveConnection(id string) {
 	if !sm.enabled {
 		return
 	}
-	
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	
+
 	if conn, exists := sm.connections[id]; exists {
 		duration := time.Since(conn.StartTime)
-		logger.Debugf("Stats: Removed connection %s (%s) after %v, sent: %d bytes, recv: %d bytes", 
+		logger.Debugf("Stats: Removed connection %s (%s) after %v, sent: %d bytes, recv: %d bytes",
 			id, conn.Type, duration, conn.BytesSent, conn.BytesRecv)
 		delete(sm.connections, id)
 	}
@@ -96,10 +96,10 @@ func (sm *StatsManager) UpdateBytes(id string, sent, recv int64) {
 	if !sm.enabled {
 		return
 	}
-	
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	
+
 	if conn, exists := sm.connections[id]; exists {
 		conn.BytesSent += sent
 		conn.BytesRecv += recv
@@ -113,13 +113,13 @@ func (sm *StatsManager) GetSimpleStats() map[string]interface{} {
 			"enabled": false,
 		}
 	}
-	
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	
+
 	tcpCount := 0
 	udpCount := 0
-	
+
 	for _, conn := range sm.connections {
 		switch conn.Type {
 		case ConnTypeTCP:
@@ -128,7 +128,7 @@ func (sm *StatsManager) GetSimpleStats() map[string]interface{} {
 			udpCount++
 		}
 	}
-	
+
 	return map[string]interface{}{
 		"enabled":           true,
 		"total_connections": len(sm.connections),
@@ -145,18 +145,18 @@ func (sm *StatsManager) GetDetailedStats() map[string]interface{} {
 			"enabled": false,
 		}
 	}
-	
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	
+
 	connections := make([]ConnectionInfo, 0, len(sm.connections))
 	for _, conn := range sm.connections {
 		connections = append(connections, *conn)
 	}
-	
+
 	simple := sm.GetSimpleStats()
 	simple["connections"] = connections
-	
+
 	return simple
 }
 
@@ -165,10 +165,10 @@ func (sm *StatsManager) LogStats() {
 	if !sm.enabled {
 		return
 	}
-	
+
 	simple := sm.GetSimpleStats()
 	logger.Infof("Connection Stats: Active=%d (TCP=%d, UDP=%d), Total Processed=%d",
-		simple["total_connections"], simple["tcp_connections"], 
+		simple["total_connections"], simple["tcp_connections"],
 		simple["udp_connections"], simple["total_processed"])
 }
 
@@ -177,22 +177,22 @@ func (sm *StatsManager) LogDetailedStats() {
 	if !sm.enabled {
 		return
 	}
-	
+
 	detailed := sm.GetDetailedStats()
 	jsonData, err := json.MarshalIndent(detailed, "", "  ")
 	if err != nil {
 		logger.Warnf("Failed to marshal detailed stats: %v", err)
 		return
 	}
-	
+
 	logger.Infof("Detailed Connection Stats:\n%s", string(jsonData))
 }
 
 // periodicLog logs statistics periodically
 func (sm *StatsManager) periodicLog() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		sm.LogStats()
 	}
