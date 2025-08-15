@@ -92,8 +92,6 @@ func (s *Server) Run() {
 	}
 }
 
-
-
 func (s *Server) handleConnection(conn net.Conn) {
 	logger.Debugf("Handling connection for %s", conn.RemoteAddr())
 
@@ -140,7 +138,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 		defer s.StatsManager.RemoveConnection(connID)
 
 		// Handle TCP tunnel
-		targetConn, err := net.Dial("tcp", initialTargetAddr)
+		d := &net.Dialer{
+			KeepAliveConfig: net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     time.Second * 2,
+				Interval: time.Second * 2,
+				Count:    5,
+			},
+		}
+		targetConn, err := d.Dial("tcp", initialTargetAddr)
 		if err != nil {
 			logger.Warnf("Failed to connect to target %s for client %s: %v", initialTargetAddr, conn.RemoteAddr(), err)
 			conn.Close()

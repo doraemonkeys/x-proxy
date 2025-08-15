@@ -206,7 +206,15 @@ func (c *Client) Dial() (net.Conn, error) {
 		}
 		return tls.Client(remoteConn, c.TLSConfig), nil
 	case "tcp":
-		return tls.Dial("tcp", c.Config.ServerAddr, c.TLSConfig)
+		dialer := &net.Dialer{
+			KeepAliveConfig: net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     time.Second * 2,
+				Interval: time.Second * 2,
+				Count:    5,
+			},
+		}
+		return tls.DialWithDialer(dialer, "tcp", c.Config.ServerAddr, c.TLSConfig)
 	default:
 		return nil, fmt.Errorf("unsupported transport type: %s", c.Config.Transport)
 	}
